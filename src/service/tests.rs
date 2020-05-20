@@ -35,14 +35,14 @@ async fn simple_session_message() {
         .build(&key2)
         .unwrap();
 
-    let mut sender_service = SessionService::new(
+    let mut sender_service = Service::new(
         sender_enr.clone(),
         key1,
         sender_enr.udp_socket().unwrap(),
         config.clone(),
     )
     .unwrap();
-    let mut receiver_service = SessionService::new(
+    let mut receiver_service = Service::new(
         receiver_enr.clone(),
         key2,
         receiver_enr.udp_socket().unwrap(),
@@ -117,14 +117,14 @@ async fn multiple_messages() {
         .build(&key2)
         .unwrap();
 
-    let mut sender_service = SessionService::new(
+    let mut sender_service = Service::new(
         sender_enr.clone(),
         key1,
         sender_enr.udp_socket().unwrap(),
         Discv5Config::default(),
     )
     .unwrap();
-    let mut receiver_service = SessionService::new(
+    let mut receiver_service = Service::new(
         receiver_enr.clone(),
         key2,
         receiver_enr.udp_socket().unwrap(),

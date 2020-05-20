@@ -7,14 +7,8 @@
 //! [`Packet`]: ../packet/index.html
 
 use super::packet::{Packet, MAGIC_LENGTH};
-use futures::prelude::*;
-use log::debug;
-use std::{
-    io,
-    net::SocketAddr,
-    pin::Pin,
-    task::{Context, Poll, Waker},
-};
+use log::warn;
+use std::{io, net::SocketAddr};
 use tokio::net::UdpSocket;
 
 pub(crate) const MAX_PACKET_SIZE: usize = 1280;
@@ -24,14 +18,10 @@ pub(crate) const MAX_PACKET_SIZE: usize = 1280;
 pub(crate) struct Transport {
     /// The UDP socket for interacting over UDP.
     socket: UdpSocket,
-    /// List of discv5 packets to send.
-    send_queue: Vec<(SocketAddr, Packet)>,
     /// The buffer to accept inbound datagrams.
     recv_buffer: [u8; MAX_PACKET_SIZE],
     /// WhoAreYou Magic Value. Used to decode raw WHOAREYOU packets.
     whoareyou_magic: [u8; MAGIC_LENGTH],
-    /// Waker to awake the thread on new messages.
-    waker: Option<Waker>,
 }
 
 impl Transport {
@@ -60,77 +50,30 @@ impl Transport {
 
         Ok(Transport {
             socket,
-            send_queue: Vec::new(),
             recv_buffer: [0; MAX_PACKET_SIZE],
             whoareyou_magic,
-            waker: None,
         })
     }
 
     /// Add packets to the send queue.
-    pub(crate) fn send(&mut self, to: SocketAddr, packet: Packet) {
-        self.send_queue.push((to, packet));
-        if let Some(waker) = &self.waker {
-            waker.wake_by_ref()
+    pub(crate) async fn send(&mut self, dst: SocketAddr, packet: Packet) {
+        match self.socket.send_to(&packet.encode(), &dst).await {
+            Err(e) => warn!("Discv5 packet not sent: {}", e),
+            Ok(x) if x == 0 => warn!("No bytes written to udp socket"),
+            Ok(_) => {} // packet sent
         }
     }
-}
 
-impl Stream for Transport {
-    type Item = (SocketAddr, Packet);
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let s = self.get_mut();
-        if let Some(waker) = &s.waker {
-            if waker.will_wake(cx.waker()) {
-                s.waker = Some(cx.waker().clone());
-            }
-        } else {
-            s.waker = Some(cx.waker().clone());
-        }
-
-        // send messages
-        while !s.send_queue.is_empty() {
-            let (dst, packet) = s.send_queue.remove(0);
-
-            match s.socket.poll_send_to(cx, &packet.encode(), &dst) {
-                Poll::Ready(Ok(bytes_written)) => {
-                    debug_assert_eq!(bytes_written, packet.encode().len());
-                }
-                Poll::Pending => {
-                    // didn't write add back and break
-                    s.send_queue.insert(0, (dst, packet));
-                    // notify to try again
-                    cx.waker().wake_by_ref();
-                    break;
-                }
-                Poll::Ready(Err(_)) => {
-                    s.send_queue.clear();
-                    break;
+    /// Receives and decodes packets from the UDP socket.
+    pub async fn recv(&mut self) -> Result<(SocketAddr, Packet), String> {
+        match self.socket.recv_from(&mut self.recv_buffer).await {
+            Ok((length, src)) => {
+                match Packet::decode(&self.recv_buffer[..length], &self.whoareyou_magic) {
+                    Ok(p) => Ok((src, p)),
+                    Err(e) => Err(format!("Could not decode discv5 packet: {:?}", e)),
                 }
             }
+            Err(e) => Err(format!("Could not read discv5 packet: {}", e)),
         }
-
-        // handle incoming messages
-        loop {
-            match s.socket.poll_recv_from(cx, &mut s.recv_buffer) {
-                Poll::Ready(Ok((length, src))) => {
-                    let whoareyou_magic = s.whoareyou_magic;
-                    match Packet::decode(&s.recv_buffer[..length], &whoareyou_magic) {
-                        Ok(p) => {
-                            return Poll::Ready(Some((src, p)));
-                        }
-                        Err(e) => debug!("Could not decode packet: {:?}", e), // could not decode the packet, drop it
-                    }
-                }
-                Poll::Pending => {
-                    break;
-                }
-                Poll::Ready(Err(_)) => {
-                    break;
-                } // wait for reconnection to poll again.
-            }
-        }
-        Poll::Pending
     }
 }

@@ -1,11 +1,11 @@
 //! Session management for the Discv5 Discovery service.
 //!
-//! The [`SessionService`] is responsible for establishing and maintaining sessions with
+//! The [`Service`] is responsible for establishing and maintaining sessions with
 //! connected/discovered nodes. Each node, identified by it's [`NodeId`] is associated with a
 //! [`Session`]. This service drives the handshakes for establishing the sessions and associated
 //! logic for sending/requesting initial connections/ENR's from unknown peers.
 //!
-//! The `SessionService` also manages the timeouts for each request and reports back RPC failures,
+//! The `Service` also manages the timeouts for each request and reports back RPC failures,
 //! session timeouts and received messages. Messages are encrypted and decrypted using the
 //! associated `Session` for each node.
 //!
@@ -30,8 +30,6 @@ use std::{
     collections::{HashMap, VecDeque},
     default::Default,
     net::SocketAddr,
-    pin::Pin,
-    task::{Context, Poll},
 };
 
 mod tests;
@@ -41,9 +39,35 @@ mod timed_sessions;
 use timed_requests::TimedRequests;
 use timed_sessions::TimedSessions;
 
-pub(crate) struct SessionService {
+#[derive(Debug)]
+/// The output from polling the `Service`.
+pub(crate) enum ServiceEvent {
+    /// A session has been established with a node.
+    Established(Enr<CombinedKey>),
+
+    /// A message was received.
+    Message {
+        src_id: NodeId,
+        src: SocketAddr,
+        message: Box<ProtocolMessage>,
+    },
+
+    /// A WHOAREYOU packet needs to be sent. This requests the protocol layer to send back the
+    /// highest known ENR.
+    WhoAreYouRequest {
+        src: SocketAddr,
+        src_id: NodeId,
+        auth_tag: AuthTag,
+    },
+
+    /// An RPC request failed. The parameters are NodeId and the RPC-ID associated with the
+    /// request.
+    RequestFailed(NodeId, u64),
+}
+
+pub(crate) struct Service {
     /// Queue of events produced by the session service.
-    events: VecDeque<SessionEvent>,
+    events: VecDeque<ServiceEvent>,
 
     /// Configuration for the discv5 service.
     config: Discv5Config,
@@ -71,11 +95,11 @@ pub(crate) struct SessionService {
     transport: Transport,
 }
 
-impl SessionService {
+impl Service {
     /* Public Functions */
 
     /// A new Session service which instantiates the UDP socket.
-    pub(crate) fn new(
+    pub fn new(
         enr: Enr<CombinedKey>,
         key: enr::CombinedKey,
         listen_socket: SocketAddr,
@@ -91,7 +115,7 @@ impl SessionService {
             magic
         };
 
-        Ok(SessionService {
+        Ok(Service {
             events: VecDeque::new(),
             enr,
             key,
@@ -105,21 +129,17 @@ impl SessionService {
     }
 
     /// The local ENR of the service.
-    pub(crate) fn enr(&self) -> &Enr<CombinedKey> {
+    pub fn enr(&self) -> &Enr<CombinedKey> {
         &self.enr
     }
 
     /// Generic function to modify a field in the local ENR.
-    pub(crate) fn enr_insert(
-        &mut self,
-        key: &str,
-        value: Vec<u8>,
-    ) -> Result<Option<Vec<u8>>, EnrError> {
+    pub fn enr_insert(&mut self, key: &str, value: Vec<u8>) -> Result<Option<Vec<u8>>, EnrError> {
         self.enr.insert(key, value, &self.key)
     }
 
     /// Updates the local ENR `SocketAddr` for either the TCP or UDP port.
-    pub(crate) fn update_local_enr_socket(
+    pub fn update_local_enr_socket(
         &mut self,
         socket: SocketAddr,
         is_tcp: bool,
@@ -140,13 +160,13 @@ impl SessionService {
     }
 
     /// Updates a session if a new ENR or an updated ENR is discovered.
-    pub(crate) fn update_enr(&mut self, enr: Enr<CombinedKey>) {
+    pub fn update_enr(&mut self, enr: Enr<CombinedKey>) {
         if let Some(session) = self.sessions.get_mut(&enr.node_id()) {
             // if an ENR is updated to an address that was not the last seen address of the
             // session, we demote the session to untrusted.
             if session.update_enr(enr.clone()) {
                 // A session have been promoted to established. Noftify the protocol
-                self.events.push_back(SessionEvent::Established(enr));
+                self.events.push_back(ServiceEvent::Established(enr));
             }
         }
     }
@@ -155,7 +175,7 @@ impl SessionService {
     /// addresses not related to the ENR.
     // To update an ENR for an unknown node, we request a FINDNODE with distance 0 to the IP
     // address that we know of.
-    pub(crate) fn send_request(
+    pub async fn send_request(
         &mut self,
         dst_enr: &Enr<CombinedKey>,
         message: ProtocolMessage,
@@ -196,7 +216,8 @@ impl SessionService {
                 // need to establish a new session, send a random packet
                 let (session, packet) = Session::new_random(self.tag(&dst_id), dst_enr.clone());
 
-                self.process_request(dst, dst_id.clone(), packet, None);
+                self.process_request(dst, dst_id.clone(), packet, None)
+                    .await;
                 self.sessions.insert(dst_id.clone(), session);
                 return Ok(());
             }
@@ -229,7 +250,7 @@ impl SessionService {
     /// therefore assumed to be valid.
     // An example of this is requesting an ENR update from a NODE who's IP address is incorrect.
     // We send this request as a response to a ping. Assume a session is valid.
-    pub(crate) fn send_request_unknown_enr(
+    pub fn send_request_unknown_enr(
         &mut self,
         dst: SocketAddr,
         dst_id: &NodeId,
@@ -254,7 +275,7 @@ impl SessionService {
 
     /// Sends an RPC Response. This differs from send request as responses do not require a
     /// known ENR to send messages and session's should already be established.
-    pub(crate) fn send_response(
+    pub async fn send_response(
         &mut self,
         dst: SocketAddr,
         dst_id: &NodeId,
@@ -278,9 +299,9 @@ impl SessionService {
         Ok(())
     }
 
-    /// This is called in response to a SessionMessage::WhoAreYou event. The protocol finds the
+    /// This is called in response to a ServiceMessage::WhoAreYou event. The protocol finds the
     /// highest known ENR then calls this function to send a WHOAREYOU packet.
-    pub(crate) fn send_whoareyou(
+    pub async fn send_whoareyou(
         &mut self,
         dst: SocketAddr,
         node_id: &NodeId,
@@ -305,7 +326,8 @@ impl SessionService {
         debug!("Sending WHOAREYOU packet to: {}", node_id);
         let (session, packet) = Session::new_whoareyou(node_id, enr_seq, remote_enr, auth_tag);
         self.sessions.insert(node_id.clone(), session);
-        self.process_request(dst, node_id.clone(), packet, None);
+        self.process_request(dst, node_id.clone(), packet, None)
+            .await;
     }
 
     /* Internal Private Functions */
@@ -333,7 +355,7 @@ impl SessionService {
     /* Packet Handling */
 
     /// Handles a WHOAREYOU packet that was received from the network.
-    fn handle_whoareyou(
+    async fn handle_whoareyou(
         &mut self,
         src: SocketAddr,
         token: AuthTag,
@@ -432,7 +454,8 @@ impl SessionService {
 
         // Send the response
         debug!("Sending Authentication response to node: {}", src_id);
-        self.process_request(src, src_id.clone(), auth_packet, Some(message));
+        self.process_request(src, src_id.clone(), auth_packet, Some(message))
+            .await;
 
         // Flush the message cache
         let _ = self.flush_messages(src, &src_id);
@@ -440,7 +463,7 @@ impl SessionService {
     }
 
     /// Handle a message that contains an authentication header.
-    fn handle_auth_message(
+    async fn handle_auth_message(
         &mut self,
         src: SocketAddr,
         tag: Tag,
@@ -493,7 +516,7 @@ impl SessionService {
                 // the session is trusted, notify the protocol
                 trace!("Session established with node: {}", src_id);
                 // session has been established, notify the protocol
-                self.events.push_back(SessionEvent::Established(
+                self.events.push_back(ServiceEvent::Established(
                     session
                         .remote_enr()
                         .clone()
@@ -526,7 +549,7 @@ impl SessionService {
     }
 
     /// Handle a standard message that does not contain an authentication header.
-    fn handle_message(
+    async fn handle_message(
         &mut self,
         src: SocketAddr,
         src_id: NodeId,
@@ -544,7 +567,7 @@ impl SessionService {
             );
             debug!("Requesting a WHOAREYOU packet to be sent.");
             // spawn a WHOAREYOU event to check for highest known ENR
-            let event = SessionEvent::WhoAreYouRequest {
+            let event = ServiceEvent::WhoAreYouRequest {
                 src,
                 src_id,
                 auth_tag,
@@ -573,7 +596,7 @@ impl SessionService {
                     src, src_id
                 );
             }
-            let event = SessionEvent::WhoAreYouRequest {
+            let event = ServiceEvent::WhoAreYouRequest {
                 src,
                 src_id,
                 auth_tag,
@@ -605,7 +628,7 @@ impl SessionService {
                 // This means we need to drop the current session and re-establish.
                 debug!("Message from node: {} is not encrypted with known session keys. Requesting a WHOAREYOU packet", src_id);
                 self.sessions.remove(&src_id);
-                let event = SessionEvent::WhoAreYouRequest {
+                let event = ServiceEvent::WhoAreYouRequest {
                     src,
                     src_id,
                     auth_tag,
@@ -626,7 +649,7 @@ impl SessionService {
 
         // we have received a new message. Notify the behaviour.
         trace!("Message received: {} from: {}", message, src_id);
-        let event = SessionEvent::Message {
+        let event = ServiceEvent::Message {
             src_id,
             src,
             message: Box::new(message),
@@ -646,7 +669,7 @@ impl SessionService {
         {
             trace!("Session has been updated to ESTABLISHED. Node: {}", src_id);
             // session has been established, notify the protocol
-            self.events.push_back(SessionEvent::Established(
+            self.events.push_back(ServiceEvent::Established(
                 session.remote_enr().clone().expect("ENR exists"),
             ));
             // update the session timeout
@@ -659,8 +682,7 @@ impl SessionService {
     }
 
     /// Encrypts and sends any messages that were waiting for a session to be established.
-    #[inline]
-    fn flush_messages(&mut self, dst: SocketAddr, dst_id: &NodeId) -> Result<(), ()> {
+    async fn flush_messages(&mut self, dst: SocketAddr, dst_id: &NodeId) -> Result<(), ()> {
         let mut requests_to_send = Vec::new();
         {
             // get the session for this id
@@ -689,15 +711,15 @@ impl SessionService {
 
         for (dst_id, packet, message) in requests_to_send.into_iter() {
             debug!("Sending cached message");
-            self.process_request(dst, dst_id.clone(), packet, message);
+            self.process_request(dst, dst_id.clone(), packet, message)
+                .await;
         }
         Ok(())
     }
 
     /// Wrapper around `transport.send()` that adds all sent messages to the `pending_requests`. This
     /// builds a request adds a timeout and sends the request.
-    #[inline]
-    fn process_request(
+    async fn process_request(
         &mut self,
         dst: SocketAddr,
         dst_id: NodeId,
@@ -706,157 +728,136 @@ impl SessionService {
     ) {
         // construct the request
         let request = Request::new(dst_id, packet, message);
-        self.transport.send(dst, request.packet.clone());
         self.pending_requests.insert(dst.clone(), request);
+        self.transport.send(dst, request.packet.clone()).await;
     }
 
     /// The heartbeat which checks for timeouts and reports back failed RPC requests/sessions.
-    fn check_timeouts(&mut self, cx: &mut Context<'_>) {
+    async fn check_timeouts(&mut self) {
         // remove expired requests/sessions
         // log pending request timeouts
-        // TODO: Split into own task, to be called only when timeouts are required
-        let sessions_ref = &mut self.sessions;
-        let transport_ref = &mut self.transport;
-        let pending_messages_ref = &mut self.pending_messages;
-        let events_ref = &mut self.events;
+        let pending_requests_ref = &self.pending_requests;
 
-        while let Poll::Ready(Some((dst, mut request))) = self.pending_requests.poll_next_unpin(cx)
-        {
-            let node_id = request.dst_id;
-            if request.retries >= self.config.request_retries {
-                // the RPC has expired
-                // determine which kind of RPC has timed out
-                match request.packet {
-                    Packet::RandomPacket { .. } | Packet::WhoAreYou { .. } => {
-                        // no response from peer, flush all pending messages
-                        if let Some(pending_messages) = pending_messages_ref.remove(&node_id) {
-                            for msg in pending_messages {
-                                events_ref.push_back(SessionEvent::RequestFailed(node_id, msg.id));
+        let expired_requests_fut = async {
+            if let Some((dst, request)) = self.pending_requests.next().await {
+                let node_id = request.dst_id;
+                if request.retries >= self.config.request_retries {
+                    // the RPC has expired
+                    // determine which kind of RPC has timed out
+                    match request.packet {
+                        Packet::RandomPacket { .. } | Packet::WhoAreYou { .. } => {
+                            // no response from peer, flush all pending messages
+                            if let Some(pending_messages) = self.pending_messages.remove(&node_id) {
+                                for msg in pending_messages {
+                                    self.events
+                                        .push_back(ServiceEvent::RequestFailed(node_id, msg.id));
+                                }
                             }
+                            // drop the session
+                            debug!("Session couldn't be established with Node: {}", node_id);
+                            self.sessions.remove(&node_id);
                         }
-                        // drop the session
-                        debug!("Session couldn't be established with Node: {}", node_id);
-                        sessions_ref.remove(&node_id);
+                        Packet::AuthMessage { .. } | Packet::Message { .. } => {
+                            debug!("Message timed out with node: {}", node_id);
+                            self.sessions.remove(&node_id);
+                            self.events.push_back(ServiceEvent::RequestFailed(
+                                node_id,
+                                request.id().expect("Auth messages have an rpc id"),
+                            ));
+                        }
                     }
-                    Packet::AuthMessage { .. } | Packet::Message { .. } => {
-                        debug!("Message timed out with node: {}", node_id);
-                        sessions_ref.remove(&node_id);
-                        events_ref.push_back(SessionEvent::RequestFailed(
-                            node_id,
-                            request.id().expect("Auth messages have an rpc id"),
-                        ));
-                    }
+                } else {
+                    // increment the request retry count and restart the timeout
+                    debug!(
+                        "Resending message: {:?} to node: {}",
+                        request.packet, node_id
+                    );
+                    self.transport.send(dst.clone(), request.packet.clone());
+                    request.retries += 1;
+                    self.pending_requests.insert(dst, request);
                 }
-            } else {
-                // increment the request retry count and restart the timeout
-                debug!(
-                    "Resending message: {:?} to node: {}",
-                    request.packet, node_id
-                );
-                transport_ref.send(dst.clone(), request.packet.clone());
-                request.retries += 1;
-                self.pending_requests.insert(dst, request);
             }
-        }
+        };
 
         // remove timed-out sessions - do not need to alert the protocol
         // Only drop a session if we are not expecting any responses.
         // TODO: Split into own task to be called only when a timeout expires
         // This is expensive, as it must loop through outgoing requests to check no request exists
         // for a given node id.
-        let pending_requests_ref = &self.pending_requests;
-        while let Poll::Ready(Some((node_id, session))) = self.sessions.poll_next_unpin(cx) {
-            if pending_requests_ref.exists(|req| req.dst_id == node_id) {
-                // add the session back in with the current request timeout
-                self.sessions
-                    .insert_at(node_id, session, self.config.request_timeout);
-            } else {
-                // fail all pending requests for this node
-                if let Some(pending_messages) = pending_messages_ref.remove(&node_id) {
-                    for msg in pending_messages {
-                        events_ref.push_back(SessionEvent::RequestFailed(node_id, msg.id));
+
+        let expired_sessions_fut = async {
+            if let Some((node_id, session)) = self.sessions.next().await {
+                if pending_requests_ref.exists(|req| req.dst_id == node_id) {
+                    // add the session back in with the current request timeout
+                    self.sessions
+                        .insert_at(node_id, session, self.config.request_timeout);
+                } else {
+                    // fail all pending requests for this node
+                    if let Some(pending_messages) = self.pending_messages.remove(&node_id) {
+                        for msg in pending_messages {
+                            self.events
+                                .push_back(ServiceEvent::RequestFailed(node_id, msg.id));
+                        }
                     }
+                    debug!("Session timed out for node: {}", node_id);
                 }
-                debug!("Session timed out for node: {}", node_id);
             }
-        }
+        };
+
+        futures::pin_mut!(expired_requests_fut);
+        futures::pin_mut!(expired_sessions_fut);
+
+        futures::future::select(expired_requests_fut, expired_sessions_fut).await;
     }
-}
 
-impl Stream for SessionService {
-    type Item = SessionEvent;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    /// The event loop that drives the session and returns a service event, when applicable.
+    pub async fn next_event(&mut self) -> ServiceEvent {
         loop {
             // process any events if necessary
             if let Some(event) = self.events.pop_front() {
-                return Poll::Ready(Some(event));
+                return event;
             }
 
-            // poll the discv5 transport
-            match self.transport.poll_next_unpin(cx) {
-                Poll::Ready(Some((src, packet))) => {
-                    match packet {
-                        Packet::WhoAreYou {
-                            token,
-                            id_nonce,
-                            enr_seq,
-                            ..
-                        } => {
-                            let _ = self.handle_whoareyou(src, token, id_nonce, enr_seq);
+            tokio::select! {
+
+                // check the transport for messages
+                recv = self.transport.recv() => {
+                    match recv {
+                        Ok((src, packet)) => {
+                        match packet {
+                            Packet::WhoAreYou {
+                                token,
+                                id_nonce,
+                                enr_seq,
+                                ..
+                            } => {
+                                let _ = self.handle_whoareyou(src, token, id_nonce, enr_seq).await;
+                            }
+                            Packet::AuthMessage {
+                                tag,
+                                auth_header,
+                                message,
+                            } => {
+                                let _ = self.handle_auth_message(src, tag, auth_header, &message).await;
+                            }
+                            Packet::Message {
+                                tag,
+                                auth_tag,
+                                message,
+                            } => {
+                                let src_id = self.src_id(&tag);
+                                let _ = self.handle_message(src, src_id, auth_tag, &message, tag).await;
+                            }
+                            Packet::RandomPacket { .. } => {} // this will not be decoded.
                         }
-                        Packet::AuthMessage {
-                            tag,
-                            auth_header,
-                            message,
-                        } => {
-                            let _ = self.handle_auth_message(src, tag, auth_header, &message);
                         }
-                        Packet::Message {
-                            tag,
-                            auth_tag,
-                            message,
-                        } => {
-                            let src_id = self.src_id(&tag);
-                            let _ = self.handle_message(src, src_id, auth_tag, &message, tag);
-                        }
-                        Packet::RandomPacket { .. } => {} // this will not be decoded.
+                    Err(e) => warn!("Discv5 packet receiving error: {}", e)
                     }
                 }
-                Poll::Ready(None) | Poll::Pending => break,
+                _ = self.check_timeouts() => {}
             }
         }
-
-        // check for timeouts
-        self.check_timeouts(cx);
-        Poll::Pending
     }
-}
-
-#[derive(Debug)]
-/// The output from polling the `SessionSerivce`.
-pub(crate) enum SessionEvent {
-    /// A session has been established with a node.
-    Established(Enr<CombinedKey>),
-
-    /// A message was received.
-    Message {
-        src_id: NodeId,
-        src: SocketAddr,
-        message: Box<ProtocolMessage>,
-    },
-
-    /// A WHOAREYOU packet needs to be sent. This requests the protocol layer to send back the
-    /// highest known ENR.
-    WhoAreYouRequest {
-        src: SocketAddr,
-        src_id: NodeId,
-        auth_tag: AuthTag,
-    },
-
-    /// An RPC request failed. The parameters are NodeId and the RPC-ID associated with the
-    /// request.
-    RequestFailed(NodeId, u64),
 }
 
 #[derive(Debug)]
