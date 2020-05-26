@@ -761,7 +761,7 @@ impl Discv5 {
             self.events
                 .push_back(Discv5Event::Discovered(enr_ref.clone()));
 
-            // ignore peers that don't pass the able filter
+            // ignore peers that don't pass the table filter
             if (self.config.table_filter)(enr_ref) {
                 let key = kbucket::Key::from(enr_ref.node_id());
                 if !self.config.ip_limit
@@ -812,7 +812,7 @@ impl Discv5 {
                     }
                     peer_count += 1;
                 }
-                debug!("{} peers found for query id {:?}", peer_count, query_id);
+                debug!("{} peers found for query id: {}", peer_count, *query_id);
                 query.on_success(source, &other_enr_iter.cloned().collect::<Vec<_>>())
             }
         }
