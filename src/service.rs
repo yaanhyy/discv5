@@ -749,10 +749,7 @@ impl Service {
                 }
             } else {
                 // increment the request retry count and restart the timeout
-                debug!(
-                    "Resending message: {:?} to node: {}",
-                    request.packet, node_id
-                );
+                debug!("Resending message: {} to node: {}", request.packet, node_id);
                 transport_ref.send(dst.clone(), request.packet.clone());
                 request.retries += 1;
                 self.pending_requests.insert(dst, request);

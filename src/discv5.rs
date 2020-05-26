@@ -689,8 +689,8 @@ impl Discv5 {
                 }
             }
         } else {
-            warn!(
-                "Request not sent. Failed to find ENR for Node: {:?}",
+            debug!(
+                "Request not sent. No known ENR (full routing table) for Node: {}",
                 node_id
             );
         }
@@ -844,12 +844,17 @@ impl Discv5 {
             }
         }
 
+        // If the node has just been added to the routing table, add it to the list of connected
+        // peers and start a ping interval for it.
+        let mut node_connected = false;
+
         match self.kbuckets.entry(&key) {
             kbucket::Entry::Present(mut entry, old_status) => {
                 if let Some(enr) = enr {
                     *entry.value() = enr;
                 }
                 if old_status != new_status {
+                    node_connected = true;
                     entry.update(new_status);
                 }
             }
@@ -859,6 +864,7 @@ impl Discv5 {
                     *entry.value() = enr;
                 }
                 if old_status != new_status {
+                    node_connected = true;
                     entry.update(new_status);
                 }
             }
@@ -874,6 +880,7 @@ impl Discv5 {
                                     node_id,
                                     replaced: None,
                                 };
+                                node_connected = true;
                                 self.events.push_back(event);
                             }
                             kbucket::InsertResult::Full => (),
@@ -882,12 +889,20 @@ impl Discv5 {
                                     .connected_peers
                                     .contains_key(disconnected.preimage()));
                                 self.send_ping(&disconnected.into_preimage());
+                                node_connected = true;
                             }
                         }
                     }
                 }
             }
             _ => {}
+        }
+
+        if new_status == NodeStatus::Connected && node_connected {
+            // send an initial ping and start the ping interval
+            self.send_ping(&node_id);
+            let interval = tokio::time::interval(self.config.ping_interval);
+            self.connected_peers.insert(node_id, interval);
         }
     }
 
@@ -897,10 +912,6 @@ impl Discv5 {
         let node_id = enr.node_id();
         debug!("Session established with Node: {}", node_id);
         self.connection_updated(node_id.clone(), Some(enr), NodeStatus::Connected);
-        // send an initial ping and start the ping interval
-        self.send_ping(&node_id);
-        let interval = tokio::time::interval(self.config.ping_interval);
-        self.connected_peers.insert(node_id, interval);
     }
 
     /// A session could not be established or an RPC request timed-out (after a few retries, if

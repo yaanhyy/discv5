@@ -333,6 +333,17 @@ impl From<DecoderError> for PacketError {
     }
 }
 
+impl std::fmt::Display for Packet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RandomPacket { .. } => write!(f, "Random"),
+            Self::WhoAreYou { .. } => write!(f, "WhoAreYou",),
+            Self::AuthMessage { .. } => write!(f, "AuthMessage"),
+            Self::Message { .. } => write!(f, "Message"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
