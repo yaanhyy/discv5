@@ -28,7 +28,7 @@ impl Digest for EcdhIdent {
         }
     }
 
-    fn input<B: AsRef<[u8]>>(&mut self, data: B) {
+    fn update(&mut self, data: impl AsRef<[u8]>) {
         // make sure input doesn't overflow
         if data.as_ref().len() <= 33 - self.index {
             self.inner[self.index..self.index + data.as_ref().len()].copy_from_slice(data.as_ref());
@@ -38,7 +38,7 @@ impl Digest for EcdhIdent {
 
     /// This digest should only be used for the ecdh library. If data is longer than 33 bytes it is
     /// truncated.
-    fn chain<B: AsRef<[u8]>>(self, data: B) -> Self {
+    fn chain(self, data: impl AsRef<[u8]>) -> Self {
         let input_data = if data.as_ref().len() <= 33 {
             &data.as_ref()[..]
         } else {
@@ -50,11 +50,11 @@ impl Digest for EcdhIdent {
         }
     }
 
-    fn result(self) -> GenericArray<u8, Self::OutputSize> {
+    fn finalize(self) -> GenericArray<u8, Self::OutputSize> {
         self.inner
     }
 
-    fn result_reset(&mut self) -> GenericArray<u8, Self::OutputSize> {
+    fn finalize_reset(&mut self) -> GenericArray<u8, Self::OutputSize> {
         let result = self.inner;
         self.inner = GenericArray::clone_from_slice(&[0; 33]);
         self.index = 0;
@@ -72,8 +72,8 @@ impl Digest for EcdhIdent {
 
     fn digest(data: &[u8]) -> GenericArray<u8, Self::OutputSize> {
         let mut h = EcdhIdent::new();
-        h.input(data);
-        h.result()
+        h.update(data);
+        h.finalize()
     }
 }
 

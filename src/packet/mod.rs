@@ -102,10 +102,10 @@ impl Packet {
     pub fn whoareyou(node_id: NodeId, enr_seq: u64, auth_tag: AuthTag) -> (Packet, Nonce) {
         let magic = {
             let mut hasher = Sha256::new();
-            hasher.input(node_id.raw());
-            hasher.input(WHOAREYOU_STRING.as_bytes());
+            hasher.update(node_id.raw());
+            hasher.update(WHOAREYOU_STRING.as_bytes());
             let mut magic = [0u8; MAGIC_LENGTH];
-            magic.copy_from_slice(&hasher.result());
+            magic.copy_from_slice(&hasher.finalize());
             magic
         };
 
@@ -369,9 +369,9 @@ mod tests {
 
     fn hash256_to_fixed_array(s: &'static str) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.input(s);
+        hasher.update(s);
         let mut result: [u8; 32] = std::default::Default::default();
-        result.clone_from_slice(hasher.result().as_slice());
+        result.clone_from_slice(hasher.finalize().as_slice());
         result
     }
 

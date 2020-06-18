@@ -212,10 +212,10 @@ impl Handler {
         // Will be removed in update
         let magic = {
             let mut hasher = Sha256::new();
-            hasher.input(enr.read().node_id().raw());
-            hasher.input(b"WHOAREYOU");
+            hasher.update(enr.read().node_id().raw());
+            hasher.update(b"WHOAREYOU");
             let mut magic: Magic = Default::default();
-            magic.copy_from_slice(&hasher.result());
+            magic.copy_from_slice(&hasher.finalize());
             magic
         };
 
