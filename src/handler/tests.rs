@@ -1,11 +1,13 @@
 #![cfg(test)]
-use super::*;
+use super::Handler;
+use enr::{CombinedKey, NodeId};
 use crate::rpc::{Request, Response};
 use crate::{Discv5ConfigBuilder, TokioExecutor};
 use enr::EnrBuilder;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::time::delay_for;
+use super::HandlerRequest;
 
 fn init() {
     let _ = env_logger::builder().is_test(true).try_init();

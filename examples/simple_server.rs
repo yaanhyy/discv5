@@ -12,19 +12,36 @@
 
 use discv5::{enr, enr::CombinedKey, Discv5, Discv5Config, Discv5Event};
 use std::net::SocketAddr;
-
+use std::io::Write;
+use chrono::Local;
+use std::net::Ipv4Addr;
 #[tokio::main]
 async fn main() {
     // allows detailed logging with the RUST_LOG env variable
-    env_logger::init();
+    //env_logger::init();
+    let env = env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV,"trace");
+    env_logger::Builder::from_env(env).format(|buf,record|{
+        writeln!(
+            buf,
+            "{} {} [{}:{}] {} {}",
+            Local::now().format("%Y-%m-%d %H:%M:%S"),
+            record.level(),
+            record.module_path().unwrap_or("<unnamed>"),
+            record.line().unwrap_or(0),
+            record.target(),
+            &record.args()
+        )
+    }).init();
 
     // listening address and port
     let listen_addr = "0.0.0.0:9000".parse::<SocketAddr>().unwrap();
 
     let enr_key = CombinedKey::generate_secp256k1();
     // construct a local ENR
-    let enr = enr::EnrBuilder::new("v4").build(&enr_key).unwrap();
+    let ip = Ipv4Addr::new(0,0,0,0);
+    let enr = enr::EnrBuilder::new("v4").ip(ip.into()).udp(9000).build(&enr_key).unwrap();
 
+    println!("enr:{:?}", enr.to_base64() );
     // default configuration
     let config = Discv5Config::default();
 
