@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use std::io::Write;
 use chrono::Local;
 use std::net::Ipv4Addr;
+use hex_literal::*;
 #[tokio::main]
 async fn main() {
     // allows detailed logging with the RUST_LOG env variable
@@ -34,11 +35,13 @@ async fn main() {
     }).init();
 
     // listening address and port
-    let listen_addr = "0.0.0.0:9000".parse::<SocketAddr>().unwrap();
+    let listen_addr = "127.0.0.1:9000".parse::<SocketAddr>().unwrap();
 
-    let enr_key = CombinedKey::generate_secp256k1();
+    let raw_key = hex!("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f292");
+    let secret_key = secp256k1::SecretKey::parse_slice(&raw_key).unwrap();
+    let mut enr_key = enr::CombinedKey::from(secret_key);
     // construct a local ENR
-    let ip = Ipv4Addr::new(0,0,0,0);
+    let ip = Ipv4Addr::new(127,0,0,1);
     let enr = enr::EnrBuilder::new("v4").ip(ip.into()).udp(9000).build(&enr_key).unwrap();
 
     println!("enr:{:?}", enr.to_base64() );
